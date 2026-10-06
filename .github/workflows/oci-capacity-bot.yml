@@ -8,6 +8,7 @@ on:
 permissions:
   contents: read
   actions: write
+  issues: write
 
 concurrency:
   group: oci-a1-capacity-bot
@@ -135,6 +136,29 @@ jobs:
 
           echo "No usable A1 capacity right now. Will retry on the next schedule."
           echo "created=false" >> "$GITHUB_OUTPUT"
+
+      - name: Notify owner on GitHub
+        if: steps.hunt.outputs.created == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = "JARVIS SERVER LISTO";
+            const { owner, repo } = context.repo;
+            const existing = await github.rest.issues.listForRepo({
+              owner,
+              repo,
+              state: "all",
+              labels: "jarvis-ready"
+            });
+            if (!existing.data.some(issue => issue.title === title)) {
+              await github.rest.issues.create({
+                owner,
+                repo,
+                title,
+                body: "Oracle ya consiguió capacidad y la instancia jarvis-server está lista. Revisa Oracle Cloud para continuar con Jarvis.",
+                labels: ["jarvis-ready"]
+              });
+            }
 
       - name: Disable watcher after success
         if: steps.hunt.outputs.created == 'true'
