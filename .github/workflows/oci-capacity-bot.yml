@@ -1,0 +1,145 @@
+name: OCI A1 Capacity Bot
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "3-58/5 * * * *"
+
+permissions:
+  contents: read
+  actions: write
+
+concurrency:
+  group: oci-a1-capacity-bot
+  cancel-in-progress: false
+
+jobs:
+  hunt:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      OCI_PRIVATE_KEY: ${{ secrets.OCI_PRIVATE_KEY }}
+      SSH_PUBLIC_KEY: ${{ secrets.SSH_PUBLIC_KEY }}
+      BOT_CONFIG: ${{ secrets.OCI_BOT_CONFIG }}
+      OCI_CLI_SUPPRESS_FILE_PERMISSIONS_WARNING: "True"
+
+    steps:
+      - name: Validate secrets
+        shell: bash
+        run: |
+          set -euo pipefail
+          for name in OCI_PRIVATE_KEY SSH_PUBLIC_KEY BOT_CONFIG; do
+            if [[ -z "${!name:-}" ]]; then
+              echo "::error::Missing repository secret: $name"
+              exit 1
+            fi
+          done
+
+      - name: Install OCI CLI
+        shell: bash
+        run: |
+          set -euo pipefail
+          python -m pip install --disable-pip-version-check --quiet oci-cli
+
+      - name: Configure OCI
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$HOME/.oci"
+          printf '%s\n' "${OCI_PRIVATE_KEY}" > "$HOME/.oci/oci_api_key.pem"
+          chmod 600 "$HOME/.oci/oci_api_key.pem"
+
+          USER_OCID=$(jq -r '.user_ocid' <<<"${BOT_CONFIG}")
+          FINGERPRINT=$(jq -r '.fingerprint' <<<"${BOT_CONFIG}")
+          TENANCY_OCID=$(jq -r '.tenancy_ocid' <<<"${BOT_CONFIG}")
+          REGION=$(jq -r '.region' <<<"${BOT_CONFIG}")
+
+          cat > "$HOME/.oci/config" <<EOF
+          [DEFAULT]
+          user=${USER_OCID}
+          fingerprint=${FINGERPRINT}
+          tenancy=${TENANCY_OCID}
+          region=${REGION}
+          key_file=$HOME/.oci/oci_api_key.pem
+          EOF
+          chmod 600 "$HOME/.oci/config"
+
+          printf '%s\n' "${SSH_PUBLIC_KEY}" > /tmp/jarvis_ssh.pub
+          chmod 600 /tmp/jarvis_ssh.pub
+
+          oci iam region list --output table >/dev/null
+          echo "OCI authentication OK."
+
+      - name: Hunt for A1 capacity
+        id: hunt
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          COMPARTMENT_OCID=$(jq -r '.compartment_ocid' <<<"${BOT_CONFIG}")
+          SUBNET_OCID=$(jq -r '.subnet_ocid' <<<"${BOT_CONFIG}")
+          IMAGE_OCID=$(jq -r '.image_ocid' <<<"${BOT_CONFIG}")
+          INSTANCE_NAME=$(jq -r '.instance_name // "jarvis-server"' <<<"${BOT_CONFIG}")
+          SHAPE=$(jq -r '.shape // "VM.Standard.A1.Flex"' <<<"${BOT_CONFIG}")
+          OCPUS=$(jq -r '.ocpus // 1' <<<"${BOT_CONFIG}")
+          MEMORY_GB=$(jq -r '.memory_gb // 6' <<<"${BOT_CONFIG}")
+
+          COUNT=$(oci compute instance list             --compartment-id "${COMPARTMENT_OCID}"             --display-name "${INSTANCE_NAME}"             --all             --output json             | jq '[.data[] | select(."lifecycle-state" != "TERMINATED")] | length')
+
+          if [[ "${COUNT}" -gt 0 ]]; then
+            echo "Target already exists."
+            echo "created=true" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          SHAPE_JSON="[{\"instanceShape\":\"${SHAPE}\",\"instanceShapeConfig\":{\"ocpus\":${OCPUS},\"memoryInGBs\":${MEMORY_GB}}}]"
+
+          mapfile -t ADS < <(jq -r '.availability_domains[]' <<<"${BOT_CONFIG}")
+
+          for AD in "${ADS[@]}"; do
+            echo "Checking ${AD}..."
+
+            STATUS=$(oci compute compute-capacity-report create               --availability-domain "${AD}"               --compartment-id "${COMPARTMENT_OCID}"               --shape-availabilities "${SHAPE_JSON}"               --query 'data."shape-availabilities"[0]."availability-status"'               --raw-output 2>/dev/null || true)
+
+            echo "${AD}: ${STATUS:-UNKNOWN}"
+
+            if [[ "${STATUS}" != "AVAILABLE" ]]; then
+              continue
+            fi
+
+            COUNT=$(oci compute instance list               --compartment-id "${COMPARTMENT_OCID}"               --display-name "${INSTANCE_NAME}"               --all               --output json               | jq '[.data[] | select(."lifecycle-state" != "TERMINATED")] | length')
+
+            if [[ "${COUNT}" -gt 0 ]]; then
+              echo "Another run already created the target."
+              echo "created=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            echo "Capacity found in ${AD}. Attempting launch..."
+
+            set +e
+            OUTPUT=$(oci compute instance launch               --availability-domain "${AD}"               --compartment-id "${COMPARTMENT_OCID}"               --display-name "${INSTANCE_NAME}"               --shape "${SHAPE}"               --shape-config "{\"ocpus\":${OCPUS},\"memoryInGBs\":${MEMORY_GB}}"               --image-id "${IMAGE_OCID}"               --subnet-id "${SUBNET_OCID}"               --assign-public-ip true               --ssh-authorized-keys-file /tmp/jarvis_ssh.pub               --wait-for-state RUNNING               --max-wait-seconds 240               --query 'data.{id:id,state:"lifecycle-state",name:"display-name"}'               --output json 2>&1)
+            RC=$?
+            set -e
+
+            echo "${OUTPUT}"
+
+            if [[ "${RC}" -eq 0 ]]; then
+              echo "SUCCESS: ${INSTANCE_NAME} created in ${AD}."
+              echo "created=true" >> "$GITHUB_OUTPUT"
+              exit 0
+            fi
+
+            echo "Launch failed or capacity disappeared. Trying the next AD."
+          done
+
+          echo "No usable A1 capacity right now. Will retry on the next schedule."
+          echo "created=false" >> "$GITHUB_OUTPUT"
+
+      - name: Disable watcher after success
+        if: steps.hunt.outputs.created == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          gh api --method PUT "repos/${GITHUB_REPOSITORY}/actions/workflows/oci-capacity-bot.yml/disable" || true
