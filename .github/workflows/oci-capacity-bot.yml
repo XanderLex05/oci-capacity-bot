@@ -148,15 +148,15 @@ jobs:
               owner,
               repo,
               state: "all",
-              labels: "jarvis-ready"
+              per_page: 100
             });
             if (!existing.data.some(issue => issue.title === title)) {
               await github.rest.issues.create({
                 owner,
                 repo,
                 title,
-                body: "Oracle ya consiguió capacidad y la instancia jarvis-server está lista. Revisa Oracle Cloud para continuar con Jarvis.",
-                labels: ["jarvis-ready"]
+                body: "@XanderLex05 Oracle ya consiguió capacidad y la instancia `jarvis-server` está lista. Revisa Oracle Cloud para continuar con Jarvis.",
+                assignees: ["XanderLex05"]
               });
             }
 
